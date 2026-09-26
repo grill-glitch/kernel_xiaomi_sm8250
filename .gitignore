@@ -134,3 +134,14 @@ all.config
 
 # fetched Android config fragments
 kernel/configs/android-*.cfg
+
+# AOSP kernel build output (mka / m bootimage)
+out/
+
+# Per-tree backup/scratch — keep out of kernel git
+/ksu-backup/
+
+# External independent git checkouts (managed outside this kernel repo)
+# See README / docs for how to populate these — they are NOT tracked here.
+/KernelSU-Next/
+/drivers/kernelsu
