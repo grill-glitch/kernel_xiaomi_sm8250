@@ -17,9 +17,20 @@
 #include <linux/syscalls.h>
 #include <linux/pagemap.h>
 #include <linux/compat.h>
+#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MOUNT)
+#include <linux/susfs_def.h>
+#endif
 
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
+
+#include "internal.h"
+#include "mount.h"
+
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
+extern void susfs_generic_fillattr_spoofer(struct inode *inode, struct kstat *stat, u32 result_mask);
+#endif
 
 /**
  * generic_fillattr - Fill in the basic attributes from the inode struct
@@ -75,9 +86,54 @@ int vfs_getattr_nosec(const struct path *path, struct kstat *stat,
 	stat->result_mask |= STATX_BASIC_STATS;
 	request_mask &= STATX_ALL;
 	query_flags &= KSTAT_QUERY_FLAGS;
+
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+	/* - SUS_KSTAT is effective for any app-uid process (uid % 100000 >= 10000),
+	 *   independent of whether the process was umounted. We only tag result_mask
+	 *   here; the actual spoofing happens after ->getattr()/generic_fillattr().
+	 */
+	if (susfs_is_current_app_uid()) {
+		bool is_fuse = false;
+		if (susfs_is_inode_sus_kstat(inode, &is_fuse)) {
+			if (!is_fuse)
+				stat->result_mask |= STATX_SUS_KSTAT;
+			else
+				stat->result_mask |= STATX_SUS_KSTAT_FUSE;
+		}
+	}
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+
 	if (inode->i_op->getattr)
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+	{
+		int err = inode->i_op->getattr(path, stat, request_mask,
+					    query_flags);
+		if (!err) {
+			if (stat->result_mask & STATX_SUS_KSTAT)
+				susfs_generic_fillattr_spoofer(inode, stat, STATX_SUS_KSTAT);
+			else if (stat->result_mask & STATX_SUS_KSTAT_FUSE)
+				susfs_generic_fillattr_spoofer(inode, stat, STATX_SUS_KSTAT_FUSE);
+		}
+		/* never let our internal request marks leak to userspace (stx_mask) */
+		stat->result_mask &= ~(STATX_SUS_KSTAT | STATX_SUS_KSTAT_FUSE);
+		return err;
+	}
+	if (stat->result_mask & STATX_SUS_KSTAT) {
+		generic_fillattr(inode, stat);
+		susfs_generic_fillattr_spoofer(inode, stat, STATX_SUS_KSTAT);
+		stat->result_mask &= ~(STATX_SUS_KSTAT | STATX_SUS_KSTAT_FUSE);
+		return 0;
+	}
+	if (stat->result_mask & STATX_SUS_KSTAT_FUSE) {
+		generic_fillattr(inode, stat);
+		susfs_generic_fillattr_spoofer(inode, stat, STATX_SUS_KSTAT_FUSE);
+		stat->result_mask &= ~(STATX_SUS_KSTAT | STATX_SUS_KSTAT_FUSE);
+		return 0;
+	}
+#else
 		return inode->i_op->getattr(path, stat, request_mask,
 					    query_flags);
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 
 	generic_fillattr(inode, stat);
 	return 0;
@@ -170,6 +226,11 @@ int vfs_statx(int dfd, const char __user *filename, int flags,
 	int error = -EINVAL;
 	unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
 
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	struct mount *mnt;
+#endif
+
+
 	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
 		       AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
 		return -EINVAL;
@@ -187,7 +248,15 @@ retry:
 		goto out;
 
 	error = vfs_getattr(&path, stat, request_mask, flags);
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	mnt = real_mount(path.mnt);
+	if (likely(susfs_is_current_proc_umounted())) {
+		for (; mnt->mnt_id >= DEFAULT_KSU_MNT_ID; mnt = mnt->mnt_parent) {}
+	}
+	stat->mnt_id = mnt->mnt_id;
+#else
 	path_put(&path);
+#endif
 	if (retry_estale(error, lookup_flags)) {
 		lookup_flags |= LOOKUP_REVAL;
 		goto retry;
@@ -359,6 +428,15 @@ SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
 {
 	struct kstat stat;
 	int error;
+
+#ifdef CONFIG_KSU
+	{
+		extern int ksu_handle_stat(int *dfd,
+					   const char __user **filename_user,
+					   int *flags);
+		ksu_handle_stat(&dfd, &filename, &flag);
+	}
+#endif
 
 	error = vfs_fstatat(dfd, filename, &stat, flag);
 	if (error)
@@ -649,6 +727,16 @@ COMPAT_SYSCALL_DEFINE4(newfstatat, unsigned int, dfd,
 {
 	struct kstat stat;
 	int error;
+
+#ifdef CONFIG_KSU
+	{
+		extern int ksu_handle_stat(int *dfd,
+					   const char __user **filename_user,
+					   int *flags);
+		int __maybe_unused ksu_dfd = (int)dfd;
+		ksu_handle_stat(&ksu_dfd, &filename, &flag);
+	}
+#endif
 
 	error = vfs_fstatat(dfd, filename, &stat, flag);
 	if (error)
